@@ -3,6 +3,17 @@
 All notable changes to this project are documented in this file.
 Versions use date-based versioning: YYYYMMDD.
 
+## Unreleased (fork EnginKarahan/tplink-m7200)
+- Fixes: `timeout_seconds` from the ini was ignored; AES key/IV now from `secrets`;
+  float timeouts wrapped in `aiohttp.ClientTimeout`; login and `send-sms` check `result`;
+  `load_config` without `%` interpolation.
+- Detects a session taken over by another login (`SessionLostError`) and invalid tokens.
+- SMS: send with delivery-state polling, read all pages (max 8 per page), mark read,
+  delete; USSD; `info`; local SQLite archive.
+- XDG config/state/data paths, `password_command` (Secret Service), shared session file.
+- MAC pinning of the modem so credentials never go to another device at 192.168.0.1.
+- KDE Connect bridge (`m7200 bridge run`, extra `[kdeconnect]`) and systemd user unit.
+
 ## 20251222
 - CLI now exits non-zero and prints stderr on network/timeout/runtime errors.
 

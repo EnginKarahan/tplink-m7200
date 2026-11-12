@@ -1,0 +1,17 @@
+[Unit]
+Description=TP-Link M7200 SMS bridge for KDE Connect
+Documentation=https://github.com/EnginKarahan/tplink-m7200
+# Needs the user's Secret Service (password_command) and kdeconnectd from the session.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/m7200 bridge run
+Restart=on-failure
+RestartSec=30
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=graphical-session.target
