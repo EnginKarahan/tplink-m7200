@@ -517,3 +517,10 @@ Kenntnis der Überlegungen den Plan und den Protokollquellcode geprüft (15 Befu
   `mark_thread_read`, Status `unknown`, Spalte `device_time`, Tabelle `meta`.
 - Der Webserver des M7200 war am 12.11. zeitweise nicht erreichbar (Port 80 abgelehnt, Internet lief
   weiter); die Brücke behandelt das als „nicht erreichbar“ und trennt den KDE-Connect-Link nach 2 Fehlversuchen.
+
+## Befunde aus dem Test auf engin-alhambra (12.11.2026)
+
+| # | Befund | Umgang |
+|---|---|---|
+| T1 | Zwei WLANs mit 192.168.0.1 (Büro 192.168.0.0/22 und M7200 192.168.0.0/24 gleichzeitig): `/proc/net/arp` hat einen Eintrag je Interface, `neighbor_mac()` nahm den ersten und ignorierte die Spalte Device. Beim Erstkontakt konnte so die MAC des Büro-Routers gepinnt werden, während die MiFi-Prüfung über die /24-Route den M7200 sah. | Behoben: `route_to()` fragt den Kernel (`ip -j route get`, Rückfall `/proc/net/route`), der Guard wertet nur ARP-Einträge auf dem Interface der Route; Route über ein Gateway oder keine Route → abgelehnt; ohne Interface und mit widersprüchlichen MACs → `None`. Meldungen nennen den Grund (`mismatch_reason()`). |
+| T2 | `looks_like_tp_link_mifi()` las nur einmal (`read()` liefert nur, was schon angekommen ist). Die Startseite ist seit dem Firmware-Update 12.617 Byte lang, „tpmifi“ steht bei Byte 11.998; der Erstkontakt scheiterte in 4 von 5 Versuchen (Exit 9). | Behoben: lesen bis Marker, EOF oder 256 KiB, Gesamtzeit begrenzt. Regressionstest liefert die Seite in Stücken; er scheitert mit dem alten Code. |

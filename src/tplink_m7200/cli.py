@@ -149,8 +149,7 @@ async def _guarded(settings: Settings) -> ModemGuard:
     guard = ModemGuard(settings.host, state_dir() / MODEM_PIN_FILE, settings.modem_mac)
     if not await guard.check():
         raise ModemIdentityError(
-            f"{settings.host} has MAC {guard.last_seen_mac or 'unknown'}, but your M7200 is "
-            f"{guard.pinned_mac()} – wrong network? (override with modem_mac in the config)"
+            f"{guard.mismatch_reason()} – wrong network? (override with modem_mac in the config)"
         )
     return guard
 

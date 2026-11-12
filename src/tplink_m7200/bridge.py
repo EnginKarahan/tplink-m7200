@@ -181,13 +181,7 @@ class Bridge:
             self._wrong_host_logged = False
             return True
         if not self._wrong_host_logged:
-            pinned = self.guard.pinned_mac()
-            if pinned:
-                LOGGER.warning("%s is not the pinned M7200 (MAC %s, expected %s); not sending credentials",
-                               self.settings.host, self.guard.last_seen_mac or "unknown", pinned)
-            else:
-                LOGGER.warning("%s is not a TP-Link MiFi on the local network (wrong Wi-Fi?); "
-                               "not sending credentials", self.settings.host)
+            LOGGER.warning("%s (wrong Wi-Fi?); not sending credentials", self.guard.mismatch_reason())
             self._wrong_host_logged = True
         return False
 

@@ -28,7 +28,7 @@ Fedora mit Plasma 6 und laufendem `kdeconnectd` (geprüft gegen kdeconnect-kde 2
    ```bash
    cd ~/Dokumente/5_CODE/tplink-m7200
    uv venv .venv && uv pip install --python .venv/bin/python -e '.[dev]'
-   .venv/bin/python -m pytest -q          # erwartet: 153 passed
+   .venv/bin/python -m pytest -q          # erwartet: 163 passed (vor den Fixes T1/T2: 153)
    ```
 3. **Installation:** `uv tool install --editable '.[kdeconnect]'` → `~/.local/bin/m7200`
 4. **Konfiguration:**
@@ -80,6 +80,10 @@ Fedora mit Plasma 6 und laufendem `kdeconnectd` (geprüft gegen kdeconnect-kde 2
   Nach einer Ablehnung fragt sie nie wieder von selbst; `m7200 bridge pair` erlaubt eine neue Anfrage.
 - Zugangsdaten gehen nur an das Gerät mit der gemerkten MAC; der erste Kontakt verlangt ein
   TP-Link-MiFi im lokalen Netz. Falsches WLAN → Exit-Code 9 bzw. Warnung im Journal.
+- Zwei WLANs gleichzeitig, die beide 192.168.0.1 nutzen (STARTPLATZ und M7200): seit Fix T1
+  zählt nur der ARP-Eintrag auf dem Interface, über das der Kernel 192.168.0.1 routet. Nach wie
+  vor gilt: Solange das M7200-WLAN verbunden ist, sind STARTPLATZ-Geräte in 192.168.0.0/24 nicht
+  erreichbar (die /24-Route gewinnt). Dauerhaft sauberer: LAN-Adresse des M7200 verlegen.
 
 ## Rückmeldung
 

@@ -12,6 +12,10 @@ Versions use date-based versioning: YYYYMMDD.
   delete; USSD; `info`; local SQLite archive.
 - XDG config/state/data paths, `password_command` (Secret Service), shared session file.
 - MAC pinning of the modem so credentials never go to another device at 192.168.0.1.
+- Modem guard reads the MAC on the interface the modem address is routed through
+  (`ip route get`, fallback `/proc/net/route`), so a second network that also uses
+  192.168.0.1 can no longer be pinned or accepted; addresses reached via a gateway are refused.
+- TP-Link MiFi detection reads the whole login page (up to 256 KiB) instead of one chunk.
 - KDE Connect bridge (`m7200 bridge run`, extra `[kdeconnect]`) and systemd user unit.
 
 ## 20251222
