@@ -32,22 +32,29 @@ wlan: getConfig=0, setConfig=1, setNoneWlan=2
 wps: get=0, set=1, start=2, cancel=3
 """
 
+import asyncio
 import base64
 import binascii
 import configparser
+import enum
 import hashlib
 import json
 import logging
 import os
-import random
+import secrets
 import tempfile
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import aiohttp
 from Cryptodome.Cipher import AES, PKCS1_v1_5
 from Cryptodome.PublicKey import RSA
 from Cryptodome.Util import Padding
+
+from .errors import ApiError, AuthError, SessionLostError, SmsTooLongError
+from .sms import MAX_SEGMENTS, sms_segments
+from .status import DeviceStatus, parse_status
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,7 +68,7 @@ def md5_hex(text: str) -> str:
 
 
 def random_numeric(length: int = 16) -> str:
-    return "".join(str(random.randint(0, 9)) for _ in range(length))
+    return "".join(str(secrets.randbelow(10)) for _ in range(length))
 
 
 def aes_encrypt_b64(plaintext: str, key_bytes: bytes, iv_bytes: bytes) -> str:
@@ -92,6 +99,57 @@ def rsa_encrypt_hex(message: str, modulus_hex: str, exponent_hex: str) -> str:
     return b"".join(chunks).hex()
 
 
+INVALID_TOKEN_RESULT = -3
+# The firmware rejects message/2 with result 1 for amountPerPage > 8 (verified on 3.0.2 Build 201023).
+MAX_PAGE_SIZE = 8
+
+
+class SendOutcome(enum.Enum):
+    """Final state of an SMS send as reported by ``message/7``."""
+
+    SENT = "sent"
+    SENT_NOT_SAVED = "sent_not_saved"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+
+    @property
+    def ok(self) -> bool:
+        return self in (SendOutcome.SENT, SendOutcome.SENT_NOT_SAVED)
+
+
+# message/7 result codes (from the web UI)
+_SEND_STATUS = {
+    0: SendOutcome.SENT,
+    1: SendOutcome.SENT_NOT_SAVED,
+    2: SendOutcome.FAILED,
+    3: SendOutcome.FAILED,
+}
+_SEND_STATUS_SENDING = 4
+
+
+class UssdStatus(enum.IntEnum):
+    WAITING = 0
+    RECEIVED = 1
+    TERMINATED = 2
+    NOT_SUPPORTED = 3
+    TIMEOUT = 4
+    ERROR = 5
+
+
+@dataclass(frozen=True)
+class UssdResult:
+    status: UssdStatus
+    response: Optional[str]
+
+
+def format_send_time(moment: datetime) -> str:
+    """``sendTime`` as the web UI builds it: comma separated, no leading zeros."""
+    return ",".join(
+        str(part)
+        for part in (moment.year, moment.month, moment.day, moment.hour, moment.minute, moment.second)
+    )
+
+
 class TPLinkM7200:
     def __init__(self, host: str, username: str, password: str, session: aiohttp.ClientSession):
         self.host = host
@@ -116,7 +174,10 @@ class TPLinkM7200:
         headers = {"Content-Type": "application/json", "Referer": f"{self.base_url}/"}
         data = json.dumps(body, separators=(",", ":"))
         LOGGER.debug("POST %s body=%s", url, data)
-        async with self.session.post(url, data=data, headers=headers, timeout=self.timeout) as resp:
+        timeout = self.timeout
+        if isinstance(timeout, (int, float)):
+            timeout = aiohttp.ClientTimeout(total=float(timeout))
+        async with self.session.post(url, data=data, headers=headers, timeout=timeout) as resp:
             text = await resp.text()
             LOGGER.debug("Response %s body=%s", resp.status, text)
             resp.raise_for_status()
@@ -173,9 +234,16 @@ class TPLinkM7200:
         challenge = await self.fetch_challenge()
         payload = self._build_login_payload(challenge)
         text = await self._post_json("/cgi-bin/auth_cgi", payload)
-        decrypted = aes_decrypt_b64(text, self.aes_key, self.aes_iv)
-        LOGGER.debug("Login decrypted=%s", decrypted)
-        data = json.loads(decrypted)
+        try:
+            decrypted = aes_decrypt_b64(text, self.aes_key, self.aes_iv)
+            data = json.loads(decrypted)
+        except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+            self.clear_session()
+            raise AuthError("Login response could not be decrypted") from exc
+        LOGGER.debug("Login decrypted (result=%s)", data.get("result"))
+        if not _is_zero(data.get("result")) or not data.get("token"):
+            self.clear_session()
+            raise AuthError(f"Login rejected by modem (result {data.get('result')!r})")
         self.token = data.get("token")
         if session_file:
             save_session_file(session_file, self.export_session())
@@ -227,8 +295,24 @@ class TPLinkM7200:
         if not self.token or not self.aes_key or not self.aes_iv or self.seq_num is None:
             raise RuntimeError("Client not authenticated. Call login() first.")
 
-    async def invoke(self, module: str, action: int, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Generic call to /cgi-bin/web_cgi (after login)."""
+    @property
+    def has_session(self) -> bool:
+        return bool(self.token and self.aes_key and self.aes_iv and self.seq_num is not None)
+
+    async def invoke(
+            self,
+            module: str,
+            action: int,
+            data: Optional[Dict[str, Any]] = None,
+            *,
+            check: bool = False,
+    ) -> Dict[str, Any]:
+        """Generic call to /cgi-bin/web_cgi (after login).
+
+        Raises ``SessionLostError`` when the answer cannot be decrypted (another client
+        logged in) or the modem reports an invalid token (result -3). With ``check=True``
+        a non-zero result raises ``ApiError``.
+        """
         self._ensure_session()
         payload = {"token": self.token, "module": module, "action": action}
         if data is not None:
@@ -243,18 +327,147 @@ class TPLinkM7200:
         LOGGER.debug("Invoke plaintext=%s len=%s sign=%s", plaintext, len(encrypted), sign_query)
 
         text = await self._post_json("/cgi-bin/web_cgi", {"data": encrypted, "sign": sign_hex})
-        decrypted = aes_decrypt_b64(text, self.aes_key, self.aes_iv)
+        try:
+            decrypted = aes_decrypt_b64(text, self.aes_key, self.aes_iv)
+            response = json.loads(decrypted)
+        except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
+            # json.JSONDecodeError is a ValueError subclass.
+            raise SessionLostError(
+                "Modem answer could not be decrypted; another client has probably logged in"
+            ) from exc
         LOGGER.debug("Invoke decrypted=%s", decrypted)
-        return json.loads(decrypted)
+        if not isinstance(response, dict):
+            raise SessionLostError("Modem answer is not a JSON object")
+        result = response.get("result")
+        if _result_code(result) == INVALID_TOKEN_RESULT:
+            raise SessionLostError("Modem rejected the session token (result -3)",
+                                   SessionLostError.INVALID_TOKEN)
+        if check and not _is_zero(result):
+            raise ApiError(module, action, result, response)
+        return response
 
     async def reboot(self) -> Dict[str, Any]:
         """Reboot device using module 'reboot', action 0."""
         return await self.invoke("reboot", 0)
 
     async def send_sms(self, number: str, text: str) -> Dict[str, Any]:
-        send_time = datetime.now().strftime("%Y,%m,%d,%H,%M,%S")
-        payload = {"sendMessage": {"to": number, "textContent": text, "sendTime": send_time}}
+        payload = {"sendMessage": {"to": number, "textContent": text, "sendTime": format_send_time(datetime.now())}}
         return await self.invoke("message", 3, payload)
+
+    async def keep_alive(self) -> None:
+        await self.invoke("webServer", 2, check=True)
+
+    async def get_device_status(self) -> DeviceStatus:
+        return parse_status(await self.invoke("status", 0, check=True))
+
+    async def get_unread_count(self) -> int:
+        status = await self.invoke("status", 0, check=True)
+        message = status.get("message")
+        if isinstance(message, dict):
+            try:
+                return int(message.get("unreadMessages") or 0)
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    async def read_sms_page(self, box: int = 0, page: int = 1, page_size: int = MAX_PAGE_SIZE) -> Tuple[List[dict], int]:
+        if not 1 <= page_size <= MAX_PAGE_SIZE:
+            raise ValueError(f"page_size must be between 1 and {MAX_PAGE_SIZE}")
+        response = await self.invoke(
+            "message", 2, {"pageNumber": page, "amountPerPage": page_size, "box": box}, check=True
+        )
+        messages = response.get("messageList") or []
+        try:
+            total = int(response.get("totalNumber") or 0)
+        except (TypeError, ValueError):
+            total = len(messages)
+        return list(messages), total
+
+    async def read_all_sms(self, box: int = 0, page_size: int = MAX_PAGE_SIZE, max_pages: int = 100) -> List[dict]:
+        collected: List[dict] = []
+        for page in range(1, max_pages + 1):
+            messages, total = await self.read_sms_page(box, page, page_size)
+            if not messages:
+                break
+            collected.extend(messages)
+            if len(collected) >= total:
+                break
+        return collected
+
+    async def mark_sms_read(self, index: int) -> None:
+        await self.invoke("message", 6, {"markReadMessage": int(index)}, check=True)
+
+    async def delete_sms(self, indices: Sequence[int], box: int = 0) -> None:
+        if not indices:
+            return
+        await self.invoke("message", 5, {"box": box, "deleteMessages": [int(i) for i in indices]}, check=True)
+
+    async def send_sms_and_wait(
+            self,
+            number: str,
+            text: str,
+            *,
+            poll_interval: float = 3.0,
+            timeout: float = 60.0,
+            now: Optional[datetime] = None,
+    ) -> SendOutcome:
+        """Send an SMS and poll ``message/7`` until the modem reports a final state."""
+        if not number or not str(number).strip():
+            raise ValueError("Recipient number must not be empty")
+        if not text:
+            raise ValueError("SMS text must not be empty")
+        segments, encoding = sms_segments(text)
+        if segments > MAX_SEGMENTS:
+            raise SmsTooLongError(
+                f"Text needs {segments} {encoding} segments; the modem sends at most {MAX_SEGMENTS}"
+            )
+        moment = now or datetime.now()
+        payload = {"sendMessage": {"to": str(number).strip(), "textContent": text,
+                                   "sendTime": format_send_time(moment)}}
+        accepted = await self.invoke("message", 3, payload)
+        if not _is_zero(accepted.get("result")):
+            return SendOutcome.FAILED
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        # Give the modem a moment so a status left over from an earlier send is not read.
+        await asyncio.sleep(min(poll_interval, 1.0))
+        while True:
+            status = await self.invoke("message", 7)
+            code = _result_code(status.get("result"))
+            if code in _SEND_STATUS:
+                return _SEND_STATUS[code]
+            if code != _SEND_STATUS_SENDING:
+                return SendOutcome.FAILED
+            if loop.time() + poll_interval > deadline:
+                return SendOutcome.TIMEOUT
+            await asyncio.sleep(poll_interval)
+
+    async def ussd(self, code: str, *, poll_interval: float = 1.0, timeout: float = 30.0) -> UssdResult:
+        """Send a USSD code (e.g. ``*100#``) and wait for the network's answer."""
+        if not code or not code.strip():
+            raise ValueError("USSD code must not be empty")
+        await self.invoke("voice", 1, {"ussdReq": code.strip()}, check=True)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            status = await self.invoke("voice", 3)
+            raw_status = _result_code(status.get("ussdStatus"))
+            if raw_status is None:
+                raw_status = UssdStatus.ERROR
+            if raw_status != UssdStatus.WAITING:
+                try:
+                    ussd_status = UssdStatus(raw_status)
+                except ValueError:
+                    ussd_status = UssdStatus.ERROR
+                response = status.get("ussdResp")
+                return UssdResult(ussd_status, str(response) if response is not None else None)
+            if loop.time() + poll_interval > deadline:
+                try:
+                    await self.invoke("voice", 2)
+                except Exception:  # cancelling is best effort
+                    LOGGER.debug("USSD cancel failed", exc_info=True)
+                return UssdResult(UssdStatus.TIMEOUT, None)
+            await asyncio.sleep(poll_interval)
 
     async def read_sms(self, page: int = 1, page_size: int = 8, box: int = 0) -> Dict[str, Any]:
         payload = {
@@ -294,6 +507,23 @@ class TPLinkM7200:
         except Exception:
             return False
         return _is_success_response(response)
+
+
+def _result_code(result: Any) -> Optional[int]:
+    if isinstance(result, bool):
+        return None
+    if isinstance(result, int):
+        return result
+    if isinstance(result, str):
+        try:
+            return int(result)
+        except ValueError:
+            return None
+    return None
+
+
+def _is_zero(result: Any) -> bool:
+    return _result_code(result) == 0
 
 
 def _is_success_response(response: Dict[str, Any]) -> bool:
@@ -401,7 +631,7 @@ def _extract_quota(status: Dict[str, Any], human: bool) -> Optional[Dict[str, An
 
 
 def load_config(path: str) -> Dict[str, Any]:
-    config = configparser.ConfigParser()
+    config = configparser.ConfigParser(interpolation=None)
     if not os.path.exists(path):
         return {}
     config.read(path)
@@ -411,6 +641,7 @@ def load_config(path: str) -> Dict[str, Any]:
         "username": modem_cfg.get("username"),
         "password": modem_cfg.get("password"),
         "session_file": modem_cfg.get("session_file"),
+        "timeout_seconds": modem_cfg.get("timeout_seconds"),
     }
 
 
@@ -428,8 +659,8 @@ def save_session_file(path: str, data: Dict[str, Any]) -> None:
     if not path:
         return
     directory = os.path.dirname(path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=".m7200_session_", dir=directory or ".")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -495,10 +726,45 @@ async def init_client(
     return client, resolved_session_file
 
 
+async def connect_client(
+        session: aiohttp.ClientSession,
+        *,
+        host: str,
+        username: str,
+        password: str,
+        session_file: Optional[str],
+        timeout_seconds: float,
+        auto_login: bool = True,
+) -> TPLinkM7200:
+    """Create a client, reuse a cached session if it is still valid, else log in.
+
+    Reusing the cached session matters: the modem only keeps one session, so every
+    fresh login logs out the web UI, the tpMiFi app or a running bridge.
+    """
+    client = TPLinkM7200(host, username, password, session)
+    client.timeout = timeout_seconds
+    cached = load_session_file(session_file) if session_file else None
+    if cached and cached.get("host") == host and cached.get("username") == username:
+        client.import_session(cached)
+        if client.has_session and not await client.validate_session():
+            client.clear_session()
+    if auto_login and not client.has_session:
+        await client.login()
+        if session_file:
+            save_session_file(session_file, client.export_session())
+    return client
+
+
 __all__ = [
     "TPLinkM7200",
+    "MAX_PAGE_SIZE",
+    "SendOutcome",
+    "UssdStatus",
+    "UssdResult",
+    "format_send_time",
     "load_config",
     "load_session_file",
     "save_session_file",
     "init_client",
+    "connect_client",
 ]

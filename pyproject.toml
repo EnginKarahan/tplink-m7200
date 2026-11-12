@@ -27,6 +27,10 @@ classifiers = [
   "Topic :: System :: Networking",
 ]
 
+[project.optional-dependencies]
+kdeconnect = ["cryptography>=41"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "cryptography>=41"]
+
 [project.urls]
 Homepage = "https://github.com/gurkein/tplink-m7200"
 Repository = "https://github.com/gurkein/tplink-m7200"
@@ -39,3 +43,9 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "--import-mode=importlib"
